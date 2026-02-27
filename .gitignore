@@ -1,0 +1,16 @@
+# Dependency directories
+node_modules/
+
+# Runtime shared-context data files
+.mcp-shared-context.jsonl
+.mcp-shared-context.jsonl.lock
+.mcp-shared-context.jsonl.sessions-index.json
+shared-context.jsonl
+shared-context.jsonl.lock
+*.jsonl
+*.jsonl.lock
+*.sessions-index.json
+active-session.txt
+
+# Local transfer/archive artifacts
+shared-context-mcp.zip

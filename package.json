@@ -1,0 +1,17 @@
+{
+  "name": "contextflowmcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ContextFlowMCP: a dependency-free MCP server that lets multiple assistants share handoff context through one JSONL file.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "self-test": "node server.mjs --self-test",
+    "pick-session": "node pick-session.mjs",
+    "test": "node --test"
+  }
+}
