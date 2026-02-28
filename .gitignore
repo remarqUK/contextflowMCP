@@ -5,11 +5,14 @@ node_modules/
 .mcp-shared-context.jsonl
 .mcp-shared-context.jsonl.lock
 .mcp-shared-context.jsonl.sessions-index.json
+.mcp-shared-context.jsonl.sessions/
 shared-context.jsonl
 shared-context.jsonl.lock
+shared-context.jsonl.sessions/
 *.jsonl
 *.jsonl.lock
 *.sessions-index.json
+*.jsonl.sessions/
 active-session.txt
 
 # Local transfer/archive artifacts

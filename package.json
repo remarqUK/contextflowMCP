@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ContextFlowMCP: a dependency-free MCP server that lets multiple assistants share handoff context through one JSONL file.",
+  "description": "ContextFlowMCP: a dependency-free MCP server that stores shared handoff context in per-session JSONL files with a fast sessions index.",
   "license": "MIT",
   "engines": {
     "node": ">=18"
