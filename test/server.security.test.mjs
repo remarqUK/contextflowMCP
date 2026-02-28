@@ -29,13 +29,27 @@ async function startClient(t, envOverrides = {}) {
   return { client, tempDir, contextFile, activeSessionFile };
 }
 
-test("append_shared_note schema requires text or content", async (t) => {
+test("append_shared_note schema avoids top-level combinators for Claude compatibility", async (t) => {
   const { client } = await startClient(t);
   const toolsResult = await client.request("tools/list");
   const noteTool = toolsResult.tools.find((tool) => tool.name === "append_shared_note");
   assert.ok(noteTool, "append_shared_note should exist");
-  assert.ok(Array.isArray(noteTool.inputSchema.anyOf), "append_shared_note schema should use anyOf");
-  assert.deepEqual(noteTool.inputSchema.anyOf, [{ required: ["text"] }, { required: ["content"] }]);
+  assert.deepEqual(noteTool.inputSchema.required, ["agent"]);
+  assert.equal(noteTool.inputSchema.anyOf, undefined);
+  assert.equal(noteTool.inputSchema.oneOf, undefined);
+  assert.equal(noteTool.inputSchema.allOf, undefined);
+});
+
+test("append_shared_note rejects missing text/content at runtime", async (t) => {
+  const { client } = await startClient(t);
+
+  const response = await client.callToolRaw("append_shared_note", {
+    agent: "claude",
+    session_id: "missing-text",
+  });
+  assert.ok(response.error, "missing text/content should return an error");
+  assert.equal(response.error.code, -32603);
+  assert.match(response.error.message, /Missing required string: text \(or content\)/);
 });
 
 test("append_shared_note accepts content alias and falls back when text is empty", async (t) => {
