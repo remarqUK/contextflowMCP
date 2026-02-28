@@ -4,16 +4,9 @@ ContextFlowMCP is a small MCP server (stdio) that lets multiple assistants share
 
 Maintainers: see `MAINTAINER.md` for architecture and amendment guidance.
 
-## Collaboration Docs
 
-- Contributor guide: `CONTRIBUTING.md`
-- Code of conduct: `CODE_OF_CONDUCT.md`
-- Security policy: `SECURITY.md`
-- Support guide: `SUPPORT.md`
-- Changelog: `CHANGELOG.md`
-- License: `LICENSE`
 
-This is designed for the workflow you described:
+This an example workflow:
 
 - Claude writes a handoff
 - Gemini reads it and continues
@@ -238,3 +231,12 @@ node --check pick-session.mjs
 npm run self-test
 npm test
 ```
+
+## Collaboration Docs
+
+- Contributor guide: `CONTRIBUTING.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
+- Security policy: `SECURITY.md`
+- Support guide: `SUPPORT.md`
+- Changelog: `CHANGELOG.md`
+- License: `LICENSE`
