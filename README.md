@@ -1,6 +1,6 @@
 # ContextFlowMCP
 
-ContextFlowMCP is a small MCP server (stdio) that lets multiple assistants share progress through one append-only JSONL file.
+ContextFlowMCP is a small MCP server (stdio) that lets multiple assistants share progress through per-session JSONL files, with a shared sessions index for fast listing.
 
 Maintainers: see `MAINTAINER.md` for architecture and amendment guidance.
 
@@ -17,13 +17,13 @@ This is designed for the workflow you described:
 
 - Claude writes a handoff
 - Gemini reads it and continues
-- Codex reads the same file and picks up where they left off
+- Codex reads the same session context and picks up where they left off
 
 ## What It Exposes
 
 - `append_shared_note`: add progress notes while working
 - `write_shared_handoff`: write a structured handoff for the next assistant
-- `read_shared_context`: read recent notes/handoffs from the shared file
+- `read_shared_context`: read recent notes/handoffs from shared session storage
 - `get_latest_handoff`: fetch the most recent handoff quickly
 - `list_sessions`: list resumable work sessions (`session_id`) like a resume picker
 - `choose_session`: choose a session from the list (by index or `session_id`)
@@ -57,10 +57,10 @@ node pick-session.mjs
 
 ## Storage Format
 
-- One shared file, append-only JSONL (`.jsonl`)
+- One append-only JSONL file per `session_id` (stored under `<context-root>.sessions/`)
 - Each line is a JSON object (`note` or `handoff`)
-- Safe for multiple MCP server processes using a simple lock file (`.lock`)
-- A sidecar session index file (`.sessions-index.json`) is maintained to speed up `list_sessions` and prompt-based session pickers.
+- A shared sessions index file (`<context-root>.sessions-index.json`) is maintained for fast `list_sessions` and prompt-based session pickers
+- Safe for multiple MCP server processes using a simple lock file (`<context-root>.lock`)
 
 ## Run
 
@@ -74,9 +74,9 @@ Or:
 npm start
 ```
 
-## Important: Point All Clients To The Same File
+## Important: Point All Clients To The Same Storage Root
 
-Every client (Gemini / Claude / Codex) must resolve to the same shared context file.
+Every client (Gemini / Claude / Codex) must resolve to the same context root path so they share the same session-files directory and index.
 
 Zero-config first run behavior (when `MCP_SHARED_CONTEXT_FILE` is unset):
 
@@ -87,10 +87,10 @@ Zero-config first run behavior (when `MCP_SHARED_CONTEXT_FILE` is unset):
 
 Recommended env vars:
 
-- `MCP_SHARED_CONTEXT_FILE`: absolute path to the shared JSONL file
-- `MCP_SHARED_CONTEXT_FOLDER`: folder containing the shared JSONL file (`<folder>/.mcp-shared-context.jsonl`)
+- `MCP_SHARED_CONTEXT_FILE`: absolute path to the context root file (used to derive `<root>.sessions/` and `<root>.sessions-index.json`)
+- `MCP_SHARED_CONTEXT_FOLDER`: folder containing the context root file (`<folder>/.mcp-shared-context.jsonl`)
 - `MCP_SHARED_CONTEXT_PROJECT` (optional): logical project key for filtering (defaults to `shared`)
-- `MCP_SHARED_CONTEXT_ACTIVE_SESSION_FILE` (optional): file storing the currently active session id (defaults to `active-session.txt` next to the shared JSONL)
+- `MCP_SHARED_CONTEXT_ACTIVE_SESSION_FILE` (optional): file storing the currently active session id (defaults to `active-session.txt` next to the context root)
 
 Security/performance guardrails (optional):
 
@@ -134,7 +134,7 @@ Use your client's MCP server config and add a stdio server entry that runs this 
 Notes:
 
 - The exact config file location/shape differs across Claude, Gemini, and Codex clients.
-- The key requirement is the same stdio command and the same resolved shared context file.
+- The key requirement is the same stdio command and the same resolved context root path.
 
 ## Suggested Workflow For All Assistants
 

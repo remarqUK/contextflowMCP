@@ -16,6 +16,7 @@ const configuredActiveSessionPath = expandHomePath(process.env.MCP_SHARED_CONTEX
 const CONTEXT_FILE = contextFileSelection.path;
 const CONTEXT_FILE_SOURCE = contextFileSelection.source;
 const CONTEXT_FILE_DISCOVERY = contextFileSelection.discovery || null;
+const SESSION_DATA_DIR = `${CONTEXT_FILE}.sessions`;
 const LOCK_FILE = `${CONTEXT_FILE}.lock`;
 const SESSION_INDEX_FILE = `${CONTEXT_FILE}.sessions-index.json`;
 const ACTIVE_SESSION_FILE = path.resolve(
@@ -23,7 +24,7 @@ const ACTIVE_SESSION_FILE = path.resolve(
 );
 const MAX_LOCK_WAIT_MS = 5000;
 const STALE_LOCK_MS = 30000;
-const SESSION_INDEX_VERSION = 1;
+const SESSION_INDEX_VERSION = 2;
 const DEFAULT_NEW_SESSION_PREFIX = process.env.MCP_SHARED_CONTEXT_NEW_SESSION_PREFIX || "session";
 const MAX_PROMPT_SESSIONS = 50;
 const PROMPT_NEW_SESSION = "new_session";
@@ -44,15 +45,8 @@ const state = {
   transportMode: null,
 };
 
-const contextCache = {
-  signature: null,
-  raw: "",
-  entries: [],
-  parseErrors: [],
-};
-
 const sessionIndexCache = {
-  contextSignature: null,
+  fileSignature: null,
   index: null,
 };
 
@@ -675,6 +669,21 @@ function normalizeSessionId(value) {
   return out || undefined;
 }
 
+function resolveEntrySessionBucket(value) {
+  return normalizeSessionId(value) || NO_SESSION_BUCKET;
+}
+
+function sessionBucketToFileKey(sessionBucket) {
+  if (sessionBucket === NO_SESSION_BUCKET) {
+    return "no-session-id";
+  }
+  return Buffer.from(sessionBucket, "utf8").toString("base64url");
+}
+
+function sessionFilePathFromKey(fileKey) {
+  return path.join(SESSION_DATA_DIR, `${fileKey}.jsonl`);
+}
+
 function sanitizeSessionId(value) {
   if (typeof value !== "string") {
     return undefined;
@@ -790,9 +799,9 @@ function makeFileSignature(stat) {
   return `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
 }
 
-async function statContextFile() {
+async function statFile(filePath) {
   try {
-    return await fs.stat(CONTEXT_FILE);
+    return await fs.stat(filePath);
   } catch (error) {
     if (error && error.code === "ENOENT") {
       return null;
@@ -801,20 +810,14 @@ async function statContextFile() {
   }
 }
 
-function invalidateContextCache() {
-  contextCache.signature = null;
-  contextCache.raw = "";
-  contextCache.entries = [];
-  contextCache.parseErrors = [];
-}
-
 function invalidateSessionIndexCache() {
-  sessionIndexCache.contextSignature = null;
+  sessionIndexCache.fileSignature = null;
   sessionIndexCache.index = null;
 }
 
-async function ensureContextDirectory() {
+async function ensureStorageDirectories() {
   await fs.mkdir(path.dirname(CONTEXT_FILE), { recursive: true });
+  await fs.mkdir(SESSION_DATA_DIR, { recursive: true });
 }
 
 function sleep(ms) {
@@ -872,39 +875,45 @@ async function withWriteLock(fn) {
 }
 
 async function appendEntry(entry) {
-  await ensureContextDirectory();
+  await ensureStorageDirectories();
   const line = `${JSON.stringify(entry)}\n`;
   await withWriteLock(async () => {
-    const beforeStat = await statContextFile();
-    const beforeSignature = makeFileSignature(beforeStat);
-    await fs.appendFile(CONTEXT_FILE, line, "utf8");
-    const afterStat = await statContextFile();
-    const afterSignature = makeFileSignature(afterStat);
-    await tryUpdateSessionIndexOnAppend(entry, { beforeSignature, afterSignature }).catch(() => {
-      invalidateSessionIndexCache();
-    });
+    let index = await loadSessionIndex();
+    if (!index) {
+      const rebuilt = await rebuildSessionIndexFromSessionFiles();
+      index = rebuilt.index;
+      await persistSessionIndex(index);
+    }
+
+    const sessionBucket = resolveEntrySessionBucket(entry.session_id);
+    const sessionRecord = ensureSessionRecord(index, sessionBucket);
+    await fs.mkdir(path.dirname(sessionRecord.file_path), { recursive: true });
+    await fs.appendFile(sessionRecord.file_path, line, "utf8");
+
+    const fileIndex =
+      Number.isInteger(index.next_file_index) && index.next_file_index >= 0 ? index.next_file_index : 0;
+    applyEntryToSessionIndex(index, entry, fileIndex);
+    if (index.next_file_index < fileIndex + 1) {
+      index.next_file_index = fileIndex + 1;
+    }
+    await persistSessionIndex(index);
   });
-  invalidateContextCache();
 }
 
-async function readRawContextFile() {
-  try {
-    const stat = await fs.stat(CONTEXT_FILE);
-    if (stat.size > MAX_CONTEXT_FILE_BYTES) {
-      throw new Error(
-        `Context file exceeds configured max size (${MAX_CONTEXT_FILE_BYTES} bytes): ${CONTEXT_FILE}`,
-      );
-    }
-    return await fs.readFile(CONTEXT_FILE, "utf8");
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      return "";
-    }
-    throw error;
+async function readRawSessionFile(filePath) {
+  const stat = await statFile(filePath);
+  if (!stat) {
+    return "";
   }
+  if (stat.size > MAX_CONTEXT_FILE_BYTES) {
+    throw new Error(
+      `Context file exceeds configured max size (${MAX_CONTEXT_FILE_BYTES} bytes): ${filePath}`,
+    );
+  }
+  return await fs.readFile(filePath, "utf8");
 }
 
-function parseEntries(rawText) {
+function parseEntries(rawText, { filePath } = {}) {
   const entries = [];
   const parseErrors = [];
   const lines = rawText.split(/\r?\n/);
@@ -920,69 +929,63 @@ function parseEntries(rawText) {
       }
       entries.push(parsed);
     } catch (error) {
-      parseErrors.push({ line: i + 1, error: String(error) });
+      parseErrors.push({ file: filePath, line: i + 1, error: String(error) });
     }
   }
   return { entries, parseErrors };
 }
 
-async function readEntries() {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const beforeStat = await statContextFile();
-    const beforeSignature = makeFileSignature(beforeStat);
-
-    if (beforeSignature && contextCache.signature === beforeSignature) {
-      return {
-        raw: contextCache.raw,
-        entries: contextCache.entries,
-        parseErrors: contextCache.parseErrors,
-        signature: contextCache.signature,
-      };
-    }
-
-    if (!beforeStat) {
-      invalidateContextCache();
-      return { raw: "", entries: [], parseErrors: [], signature: null };
-    }
-
-    if (beforeStat.size > MAX_CONTEXT_FILE_BYTES) {
-      throw new Error(
-        `Context file exceeds configured max size (${MAX_CONTEXT_FILE_BYTES} bytes): ${CONTEXT_FILE}`,
-      );
-    }
-
-    const raw = await fs.readFile(CONTEXT_FILE, "utf8");
-    const afterStat = await statContextFile();
-    const afterSignature = makeFileSignature(afterStat);
-
-    // Avoid caching torn reads if another process appends while we are reading.
-    if (beforeSignature && afterSignature && beforeSignature !== afterSignature && attempt === 0) {
-      continue;
-    }
-
-    const { entries, parseErrors } = parseEntries(raw);
-    if (afterSignature && beforeSignature && beforeSignature === afterSignature) {
-      contextCache.signature = afterSignature;
-      contextCache.raw = raw;
-      contextCache.entries = entries;
-      contextCache.parseErrors = parseErrors;
-    } else {
-      invalidateContextCache();
-    }
-    return { raw, entries, parseErrors, signature: beforeSignature && beforeSignature === afterSignature ? afterSignature : null };
-  }
-
-  const raw = await readRawContextFile();
-  const { entries, parseErrors } = parseEntries(raw);
-  return { raw, entries, parseErrors, signature: null };
-}
-
-function makeSessionIndexSkeleton(contextSignature = null) {
+function makeSessionIndexSkeleton() {
   return {
     version: SESSION_INDEX_VERSION,
-    context_signature: contextSignature,
     next_file_index: 0,
+    sessions: {},
     projects: {},
+  };
+}
+
+function copySessionSummaryFields(summary, summaryRaw) {
+  summary.entry_count =
+    Number.isInteger(summaryRaw.entry_count) && summaryRaw.entry_count >= 0 ? summaryRaw.entry_count : 0;
+  summary.note_count =
+    Number.isInteger(summaryRaw.note_count) && summaryRaw.note_count >= 0 ? summaryRaw.note_count : 0;
+  summary.handoff_count =
+    Number.isInteger(summaryRaw.handoff_count) && summaryRaw.handoff_count >= 0 ? summaryRaw.handoff_count : 0;
+  summary.latest_ts = typeof summaryRaw.latest_ts === "string" && summaryRaw.latest_ts ? summaryRaw.latest_ts : undefined;
+  summary.latest_ts_ms =
+    typeof summaryRaw.latest_ts_ms === "number" && Number.isFinite(summaryRaw.latest_ts_ms)
+      ? summaryRaw.latest_ts_ms
+      : null;
+  summary.latest_file_index =
+    Number.isInteger(summaryRaw.latest_file_index) && summaryRaw.latest_file_index >= -1
+      ? summaryRaw.latest_file_index
+      : -1;
+  summary.last_entry_kind =
+    summaryRaw.last_entry_kind === "note" || summaryRaw.last_entry_kind === "handoff"
+      ? summaryRaw.last_entry_kind
+      : undefined;
+  summary.task = typeof summaryRaw.task === "string" && summaryRaw.task.trim() ? summaryRaw.task.trim() : undefined;
+  summary.latest_handoff_summary =
+    typeof summaryRaw.latest_handoff_summary === "string" && summaryRaw.latest_handoff_summary.trim()
+      ? summaryRaw.latest_handoff_summary.trim()
+      : undefined;
+  if (Array.isArray(summaryRaw.agents)) {
+    summaryRaw.agents.forEach((agent) => pushUniqueString(summary.agents, agent));
+    summary.agents.sort();
+  }
+}
+
+function normalizeSessionRecord(sessionId, rawRecord) {
+  const fileKey =
+    typeof rawRecord?.file_key === "string" && rawRecord.file_key.trim()
+      ? rawRecord.file_key.trim()
+      : sessionBucketToFileKey(sessionId);
+  const summary = makeSessionSummary(sessionId, undefined);
+  copySessionSummaryFields(summary, rawRecord || {});
+  return {
+    ...summary,
+    file_key: fileKey,
+    file_path: sessionFilePathFromKey(fileKey),
   };
 }
 
@@ -993,9 +996,15 @@ function normalizeSessionIndex(raw) {
   if (raw.version !== SESSION_INDEX_VERSION) {
     return null;
   }
-  const contextSignature = typeof raw.context_signature === "string" ? raw.context_signature : null;
   const nextFileIndex =
     Number.isInteger(raw.next_file_index) && raw.next_file_index >= 0 ? raw.next_file_index : 0;
+  const sessions = {};
+  if (isObject(raw.sessions)) {
+    Object.entries(raw.sessions).forEach(([sessionIdKey, rawRecord]) => {
+      const sessionId = resolveEntrySessionBucket(sessionIdKey);
+      sessions[sessionId] = normalizeSessionRecord(sessionId, rawRecord);
+    });
+  }
   const projects = {};
   if (isObject(raw.projects)) {
     Object.entries(raw.projects).forEach(([projectName, bucketRaw]) => {
@@ -1013,43 +1022,19 @@ function normalizeSessionIndex(raw) {
           return;
         }
         const summary = makeSessionSummary(sessionId, projectName);
-        summary.entry_count =
-          Number.isInteger(summaryRaw.entry_count) && summaryRaw.entry_count >= 0 ? summaryRaw.entry_count : 0;
-        summary.note_count =
-          Number.isInteger(summaryRaw.note_count) && summaryRaw.note_count >= 0 ? summaryRaw.note_count : 0;
-        summary.handoff_count =
-          Number.isInteger(summaryRaw.handoff_count) && summaryRaw.handoff_count >= 0 ? summaryRaw.handoff_count : 0;
-        summary.latest_ts = typeof summaryRaw.latest_ts === "string" && summaryRaw.latest_ts ? summaryRaw.latest_ts : undefined;
-        summary.latest_ts_ms =
-          typeof summaryRaw.latest_ts_ms === "number" && Number.isFinite(summaryRaw.latest_ts_ms)
-            ? summaryRaw.latest_ts_ms
-            : null;
-        summary.latest_file_index =
-          Number.isInteger(summaryRaw.latest_file_index) && summaryRaw.latest_file_index >= -1
-            ? summaryRaw.latest_file_index
-            : -1;
-        summary.last_entry_kind =
-          summaryRaw.last_entry_kind === "note" || summaryRaw.last_entry_kind === "handoff"
-            ? summaryRaw.last_entry_kind
-            : undefined;
-        summary.task = typeof summaryRaw.task === "string" && summaryRaw.task.trim() ? summaryRaw.task.trim() : undefined;
-        summary.latest_handoff_summary =
-          typeof summaryRaw.latest_handoff_summary === "string" && summaryRaw.latest_handoff_summary.trim()
-            ? summaryRaw.latest_handoff_summary.trim()
-            : undefined;
-        if (Array.isArray(summaryRaw.agents)) {
-          summaryRaw.agents.forEach((agent) => pushUniqueString(summary.agents, agent));
-          summary.agents.sort();
-        }
+        copySessionSummaryFields(summary, summaryRaw);
         bucket[sessionId] = summary;
+        if (!sessions[sessionId]) {
+          sessions[sessionId] = normalizeSessionRecord(sessionId, {});
+        }
       });
       projects[projectName] = bucket;
     });
   }
   return {
     version: SESSION_INDEX_VERSION,
-    context_signature: contextSignature,
     next_file_index: nextFileIndex,
+    sessions,
     projects,
   };
 }
@@ -1068,42 +1053,37 @@ async function readSessionIndexFile() {
 }
 
 async function writeSessionIndexFile(index) {
-  await ensureContextDirectory();
+  await ensureStorageDirectories();
   const tmpPath = `${SESSION_INDEX_FILE}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   await fs.writeFile(tmpPath, `${JSON.stringify(index)}\n`, "utf8");
   await fs.rename(tmpPath, SESSION_INDEX_FILE);
 }
 
-async function loadSessionIndex(expectedContextSignature) {
-  if (!expectedContextSignature) {
+async function loadSessionIndex() {
+  const stat = await statFile(SESSION_INDEX_FILE);
+  const fileSignature = makeFileSignature(stat);
+  if (!fileSignature) {
     return null;
   }
-  if (
-    sessionIndexCache.contextSignature === expectedContextSignature &&
-    sessionIndexCache.index &&
-    sessionIndexCache.index.context_signature === expectedContextSignature
-  ) {
+  if (sessionIndexCache.fileSignature === fileSignature && sessionIndexCache.index) {
     return sessionIndexCache.index;
   }
 
   const index = await readSessionIndexFile();
-  if (!index || index.context_signature !== expectedContextSignature) {
+  if (!index) {
     invalidateSessionIndexCache();
     return null;
   }
-  sessionIndexCache.contextSignature = expectedContextSignature;
+  sessionIndexCache.fileSignature = fileSignature;
   sessionIndexCache.index = index;
   return index;
 }
 
 async function persistSessionIndex(index) {
-  try {
-    await writeSessionIndexFile(index);
-    sessionIndexCache.contextSignature = index.context_signature;
-    sessionIndexCache.index = index;
-  } catch {
-    invalidateSessionIndexCache();
-  }
+  await writeSessionIndexFile(index);
+  const stat = await statFile(SESSION_INDEX_FILE);
+  sessionIndexCache.fileSignature = makeFileSignature(stat);
+  sessionIndexCache.index = index;
 }
 
 function getSessionProject(entry) {
@@ -1113,7 +1093,32 @@ function getSessionProject(entry) {
   return DEFAULT_PROJECT;
 }
 
+function ensureSessionRecord(index, sessionId) {
+  if (!isObject(index.sessions)) {
+    index.sessions = {};
+  }
+  const normalizedSessionId = resolveEntrySessionBucket(sessionId);
+  let record = index.sessions[normalizedSessionId];
+  if (!isObject(record)) {
+    record = normalizeSessionRecord(normalizedSessionId, {
+      file_key: sessionBucketToFileKey(normalizedSessionId),
+    });
+    index.sessions[normalizedSessionId] = record;
+  } else {
+    const fileKey =
+      typeof record.file_key === "string" && record.file_key.trim()
+        ? record.file_key.trim()
+        : sessionBucketToFileKey(normalizedSessionId);
+    record.file_key = fileKey;
+    record.file_path = sessionFilePathFromKey(fileKey);
+  }
+  return record;
+}
+
 function applyEntryToSessionIndex(index, entry, fileIndex) {
+  if (!isObject(index.sessions)) {
+    index.sessions = {};
+  }
   if (!isObject(index.projects)) {
     index.projects = {};
   }
@@ -1121,10 +1126,11 @@ function applyEntryToSessionIndex(index, entry, fileIndex) {
     index.next_file_index = Math.max(index.next_file_index || 0, fileIndex + 1);
   }
 
-  const sessionId = normalizeSessionId(entry.session_id);
-  if (!sessionId) {
-    return;
-  }
+  const sessionId = resolveEntrySessionBucket(entry.session_id);
+  const sessionRecord = ensureSessionRecord(index, sessionId);
+  applyEntryToSessionSummary(sessionRecord, entry, fileIndex);
+  sessionRecord.agents.sort();
+
   const project = getSessionProject(entry);
   if (!isObject(index.projects[project])) {
     index.projects[project] = {};
@@ -1136,17 +1142,6 @@ function applyEntryToSessionIndex(index, entry, fileIndex) {
   index.projects[project][sessionId].agents.sort();
 }
 
-function buildSessionIndexFromEntries(entries, contextSignature) {
-  const index = makeSessionIndexSkeleton(contextSignature);
-  entries.forEach((entry, fileIndex) => {
-    applyEntryToSessionIndex(index, entry, fileIndex);
-  });
-  if (!Number.isInteger(index.next_file_index) || index.next_file_index < entries.length) {
-    index.next_file_index = entries.length;
-  }
-  return index;
-}
-
 function listProjectSessionsFromIndex(index, project) {
   if (!index || !isObject(index.projects)) {
     return [];
@@ -1155,38 +1150,214 @@ function listProjectSessionsFromIndex(index, project) {
   if (!isObject(bucket)) {
     return [];
   }
-  const summaries = Object.values(bucket).map((summary) => ({
-    ...summary,
-    agents: Array.isArray(summary.agents) ? [...summary.agents].sort() : [],
-  }));
+  const summaries = Object.values(bucket)
+    .filter((summary) => summary?.session_id !== NO_SESSION_BUCKET)
+    .map((summary) => ({
+      ...summary,
+      agents: Array.isArray(summary.agents) ? [...summary.agents].sort() : [],
+    }));
   return sortSessionSummaries(summaries);
 }
 
-async function tryUpdateSessionIndexOnAppend(entry, { beforeSignature, afterSignature }) {
-  if (!afterSignature) {
-    invalidateSessionIndexCache();
-    return;
+function listSessionRecords(index) {
+  if (!index || !isObject(index.sessions)) {
+    return [];
   }
+  return Object.values(index.sessions)
+    .map((record) => ({
+      ...record,
+      agents: Array.isArray(record.agents) ? [...record.agents].sort() : [],
+    }))
+    .sort((a, b) => {
+      const aIndex = Number.isInteger(a.latest_file_index) ? a.latest_file_index : -1;
+      const bIndex = Number.isInteger(b.latest_file_index) ? b.latest_file_index : -1;
+      if (aIndex !== bIndex) return aIndex - bIndex;
+      return String(a.session_id).localeCompare(String(b.session_id));
+    });
+}
 
-  let index = null;
-  if (!beforeSignature) {
-    index = makeSessionIndexSkeleton(afterSignature);
-  } else {
-    index = await loadSessionIndex(beforeSignature);
-    if (!index) {
-      invalidateSessionIndexCache();
-      return;
+async function listSessionDataFiles() {
+  try {
+    const dirEntries = await fs.readdir(SESSION_DATA_DIR, { withFileTypes: true });
+    const files = await Promise.all(
+      dirEntries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+        .map(async (entry) => {
+          const filePath = path.join(SESSION_DATA_DIR, entry.name);
+          const stat = await statFile(filePath);
+          return {
+            filePath,
+            mtimeMs: typeof stat?.mtimeMs === "number" ? stat.mtimeMs : 0,
+          };
+        }),
+    );
+    return files
+      .sort((a, b) => (a.mtimeMs - b.mtimeMs) || a.filePath.localeCompare(b.filePath))
+      .map((file) => file.filePath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return [];
     }
-    index.context_signature = afterSignature;
+    throw error;
+  }
+}
+
+async function migrateLegacyContextFileToSessionFilesIfNeeded() {
+  const existingSessionFiles = await listSessionDataFiles();
+  if (existingSessionFiles.length) {
+    return { migrated: false, index: null, parseErrors: [] };
   }
 
-  const fileIndex =
-    Number.isInteger(index.next_file_index) && index.next_file_index >= 0 ? index.next_file_index : 0;
-  applyEntryToSessionIndex(index, entry, fileIndex);
-  if (index.next_file_index < fileIndex + 1) {
-    index.next_file_index = fileIndex + 1;
+  const legacyStat = await statFile(CONTEXT_FILE);
+  if (!legacyStat || !legacyStat.isFile() || legacyStat.size === 0) {
+    return { migrated: false, index: null, parseErrors: [] };
   }
-  await persistSessionIndex(index);
+
+  const raw = await readRawSessionFile(CONTEXT_FILE);
+  if (!raw.trim()) {
+    return { migrated: false, index: null, parseErrors: [] };
+  }
+
+  const { entries, parseErrors } = parseEntries(raw, { filePath: CONTEXT_FILE });
+  if (!entries.length) {
+    return { migrated: false, index: null, parseErrors };
+  }
+
+  const groupedLines = new Map();
+  const index = makeSessionIndexSkeleton();
+  entries.forEach((entry, order) => {
+    const sessionBucket = resolveEntrySessionBucket(entry.session_id);
+    const filePath = sessionFilePathFromKey(sessionBucketToFileKey(sessionBucket));
+    const existing = groupedLines.get(filePath) || [];
+    existing.push(`${JSON.stringify(entry)}\n`);
+    groupedLines.set(filePath, existing);
+    applyEntryToSessionIndex(index, entry, order);
+  });
+  index.next_file_index = Math.max(index.next_file_index || 0, entries.length);
+
+  for (const [filePath, lines] of groupedLines.entries()) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, lines.join(""), "utf8");
+  }
+
+  return { migrated: true, index, parseErrors };
+}
+
+async function readSessionFileEntries(filePath) {
+  const raw = await readRawSessionFile(filePath);
+  return parseEntries(raw, { filePath });
+}
+
+async function readRawContextFile() {
+  const { index } = await getOrBuildSessionIndex();
+  const records = listSessionRecords(index);
+  if (!records.length) {
+    return "";
+  }
+  const chunks = [];
+  for (const record of records) {
+    if (typeof record.file_path !== "string" || !record.file_path) {
+      continue;
+    }
+    const raw = await readRawSessionFile(record.file_path);
+    if (!raw) {
+      continue;
+    }
+    chunks.push(raw.endsWith("\n") ? raw : `${raw}\n`);
+  }
+  return chunks.join("");
+}
+
+function compareEntriesByTsThenOrder(a, b) {
+  const aTs = Number.isFinite(a.tsMs) ? a.tsMs : Number.NEGATIVE_INFINITY;
+  const bTs = Number.isFinite(b.tsMs) ? b.tsMs : Number.NEGATIVE_INFINITY;
+  if (aTs !== bTs) {
+    return aTs - bTs;
+  }
+  return a.order - b.order;
+}
+
+async function rebuildSessionIndexFromSessionFiles() {
+  await ensureStorageDirectories();
+  const migration = await migrateLegacyContextFileToSessionFilesIfNeeded();
+  if (migration.migrated && migration.index) {
+    return { index: migration.index, parseErrors: migration.parseErrors };
+  }
+
+  const index = makeSessionIndexSkeleton();
+  const parseErrors = [...migration.parseErrors];
+  const sessionFiles = await listSessionDataFiles();
+  let order = 0;
+
+  for (const filePath of sessionFiles) {
+    const { entries, parseErrors: fileErrors } = await readSessionFileEntries(filePath);
+    parseErrors.push(...fileErrors);
+    entries.forEach((entry) => {
+      applyEntryToSessionIndex(index, entry, order);
+      order += 1;
+    });
+  }
+
+  index.next_file_index = Math.max(index.next_file_index || 0, order);
+  return { index, parseErrors };
+}
+
+async function getOrBuildSessionIndex() {
+  const existing = await loadSessionIndex();
+  if (existing) {
+    return { index: existing, parseErrors: [] };
+  }
+  const rebuilt = await rebuildSessionIndexFromSessionFiles();
+  await persistSessionIndex(rebuilt.index);
+  return rebuilt;
+}
+
+function resolveSessionFilePath(index, sessionId) {
+  const sessionBucket = resolveEntrySessionBucket(sessionId);
+  const record = isObject(index?.sessions?.[sessionBucket]) ? index.sessions[sessionBucket] : null;
+  if (record && typeof record.file_path === "string" && record.file_path) {
+    return record.file_path;
+  }
+  return sessionFilePathFromKey(sessionBucketToFileKey(sessionBucket));
+}
+
+async function readEntries({ sessionIds } = {}) {
+  const { index, parseErrors: indexParseErrors } = await getOrBuildSessionIndex();
+  const requestedSessionIds = Array.isArray(sessionIds)
+    ? sessionIds.map((sessionId) => resolveEntrySessionBucket(sessionId))
+    : null;
+  const targetSessionIds =
+    requestedSessionIds && requestedSessionIds.length ? requestedSessionIds : Object.keys(index.sessions || {});
+
+  if (!targetSessionIds.length) {
+    return { entries: [], parseErrors: indexParseErrors };
+  }
+
+  const parseErrors = [...indexParseErrors];
+  const wrapped = [];
+  let order = 0;
+  for (const sessionId of targetSessionIds) {
+    const filePath = resolveSessionFilePath(index, sessionId);
+    const { entries: sessionEntries, parseErrors: sessionErrors } = await readSessionFileEntries(filePath);
+    parseErrors.push(...sessionErrors);
+    sessionEntries.forEach((entry) => {
+      wrapped.push({
+        entry,
+        order,
+        tsMs: Date.parse(typeof entry.ts === "string" ? entry.ts : ""),
+      });
+      order += 1;
+    });
+  }
+
+  if (targetSessionIds.length > 1) {
+    wrapped.sort(compareEntriesByTsThenOrder);
+  }
+
+  return {
+    entries: wrapped.map((item) => item.entry),
+    parseErrors,
+  };
 }
 
 function filterEntries(entries, filters = {}) {
@@ -1408,36 +1579,8 @@ async function buildSessionListResult(options) {
     !options.includeUnsessioned;
 
   if (canUseIndex) {
-    const stat = await statContextFile();
-    const contextSignature = makeFileSignature(stat);
-    if (!contextSignature) {
-      return { parseErrors: [], allSessions: [], visibleSessions: [] };
-    }
-
-    const indexed = await loadSessionIndex(contextSignature);
-    if (indexed) {
-      const allSessions = listProjectSessionsFromIndex(indexed, options.project);
-      return {
-        parseErrors: [],
-        allSessions,
-        visibleSessions: allSessions.slice(0, options.limit),
-      };
-    }
-
-    const { entries, parseErrors, signature } = await readEntries();
-    const filtered = filterEntries(entries, {
-      project: options.project,
-      agent: options.agent,
-      since: options.since,
-    });
-    const allSessions = buildSessionSummaries(filtered, {
-      includeUnsessioned: options.includeUnsessioned,
-    });
-    const indexSignature = signature || contextSignature;
-    if (indexSignature) {
-      const rebuiltIndex = buildSessionIndexFromEntries(entries, indexSignature);
-      await persistSessionIndex(rebuiltIndex);
-    }
+    const { index, parseErrors } = await getOrBuildSessionIndex();
+    const allSessions = listProjectSessionsFromIndex(index, options.project);
     return {
       parseErrors,
       allSessions,
@@ -1620,8 +1763,9 @@ async function callTool(name, rawArgs) {
       tags,
     };
     await appendEntry(entry);
+    const entryFile = sessionFilePathFromKey(sessionBucketToFileKey(resolveEntrySessionBucket(entry.session_id)));
     return toolText(
-      `Appended note ${entry.id} to ${CONTEXT_FILE}\nproject=${entry.project}\nagent=${entry.agent}\nts=${entry.ts}`,
+      `Appended note ${entry.id} to ${entryFile}\nproject=${entry.project}\nagent=${entry.agent}\nts=${entry.ts}`,
     );
   }
 
@@ -1643,8 +1787,9 @@ async function callTool(name, rawArgs) {
       files,
     };
     await appendEntry(entry);
+    const entryFile = sessionFilePathFromKey(sessionBucketToFileKey(resolveEntrySessionBucket(entry.session_id)));
     return toolText(
-      `Wrote handoff ${entry.id} to ${CONTEXT_FILE}\nproject=${entry.project}\nagent=${entry.agent}\nts=${entry.ts}`,
+      `Wrote handoff ${entry.id} to ${entryFile}\nproject=${entry.project}\nagent=${entry.agent}\nts=${entry.ts}`,
     );
   }
 
@@ -1659,19 +1804,23 @@ async function callTool(name, rawArgs) {
     const since = asIsoDateOrUndefined(args.since, "since");
     const limit = asPositiveInt(args.limit, "limit", 20, 1, 200);
     const format = normalizeFormat(args.format);
-    const { entries, parseErrors } = await readEntries();
+    const sourceFile = session_id ? resolveSessionFilePath(null, session_id) : SESSION_DATA_DIR;
+    const { entries, parseErrors } = await readEntries({
+      sessionIds: session_id ? [session_id] : undefined,
+    });
     const filtered = filterEntries(entries, { project, agent, session_id, kind, since });
     const recent = selectRecent(filtered, limit);
     if (format === "json") {
       return toolJson({
-        file: CONTEXT_FILE,
+        file: sourceFile,
+        indexFile: SESSION_INDEX_FILE,
         filters: { project, agent, session_id, kind, since, limit },
         count: recent.length,
         parseErrors,
         entries: recent,
       });
     }
-    return toolText(summarizeRead(recent, parseErrors, CONTEXT_FILE));
+    return toolText(summarizeRead(recent, parseErrors, sourceFile));
   }
 
   if (name === "get_latest_handoff") {
@@ -1679,16 +1828,19 @@ async function callTool(name, rawArgs) {
     const agent = asString(args.agent, "agent");
     const session_id = await resolveSessionIdInput(args.session_id);
     const format = normalizeFormat(args.format);
-    const { entries, parseErrors } = await readEntries();
+    const sourceFile = session_id ? resolveSessionFilePath(null, session_id) : SESSION_DATA_DIR;
+    const { entries, parseErrors } = await readEntries({
+      sessionIds: session_id ? [session_id] : undefined,
+    });
     const handoffs = filterEntries(entries, { project, agent, session_id, kind: "handoff" });
     const latest = handoffs.length ? handoffs[handoffs.length - 1] : null;
     if (!latest) {
-      return toolText(`No handoff found in ${CONTEXT_FILE} for project=${project}.`);
+      return toolText(`No handoff found in ${sourceFile} for project=${project}.`);
     }
     if (format === "json") {
-      return toolJson({ file: CONTEXT_FILE, parseErrors, handoff: latest });
+      return toolJson({ file: sourceFile, indexFile: SESSION_INDEX_FILE, parseErrors, handoff: latest });
     }
-    const text = `Latest handoff from ${CONTEXT_FILE}\n${formatEntry(latest, 0)}${
+    const text = `Latest handoff from ${sourceFile}\n${formatEntry(latest, 0)}${
       parseErrors.length ? `\n\nNote: skipped ${parseErrors.length} malformed JSONL line(s).` : ""
     }`;
     return toolText(text);
@@ -1701,7 +1853,7 @@ async function callTool(name, rawArgs) {
 
     if (format === "json") {
       return toolJson({
-        file: CONTEXT_FILE,
+        file: SESSION_INDEX_FILE,
         project,
         filters: { agent, since, limit, include_unsessioned: includeUnsessioned },
         count: sessions.length,
@@ -1711,7 +1863,7 @@ async function callTool(name, rawArgs) {
     }
 
     return toolText(
-      summarizeSessionsText(sessions, CONTEXT_FILE, { project, parseErrors }),
+      summarizeSessionsText(sessions, SESSION_INDEX_FILE, { project, parseErrors }),
     );
   }
 
@@ -1744,7 +1896,7 @@ async function callTool(name, rawArgs) {
     } else {
       selected = allSessions.find((session) => session.session_id === session_id) || null;
       if (!selected) {
-        return toolText(`Session ${session_id} not found in ${CONTEXT_FILE} for project=${project}.`, true);
+        return toolText(`Session ${session_id} not found in ${SESSION_INDEX_FILE} for project=${project}.`, true);
       }
     }
 
@@ -1759,7 +1911,7 @@ async function callTool(name, rawArgs) {
 
     if (format === "json") {
       return toolJson({
-        file: CONTEXT_FILE,
+        file: SESSION_INDEX_FILE,
         project,
         parseErrors,
         selected_session: selected,
@@ -1770,7 +1922,7 @@ async function callTool(name, rawArgs) {
     }
 
     const lines = [];
-    lines.push(`Selected session from ${CONTEXT_FILE}`);
+    lines.push(`Selected session from ${SESSION_INDEX_FILE}`);
     lines.push(formatSessionSummary(selected, 0));
     lines.push("");
     lines.push("Next: call resume_session with:");
@@ -1788,18 +1940,19 @@ async function callTool(name, rawArgs) {
     const limit = asPositiveInt(args.limit, "limit", 20, 1, 200);
     const format = normalizeFormat(args.format);
 
-    const { entries, parseErrors } = await readEntries();
+    const sessionFile = resolveSessionFilePath(null, session_id);
+    const { entries, parseErrors } = await readEntries({ sessionIds: [session_id] });
     const resumeData = buildResumeSessionData(entries, parseErrors, { project, session_id, limit });
     if (!resumeData) {
-      return toolText(`No entries found for session_id=${session_id} in ${CONTEXT_FILE} (project=${project}).`);
+      return toolText(`No entries found for session_id=${session_id} in ${sessionFile} (project=${project}).`);
     }
 
     if (format === "json") {
-      return toolJson({ file: CONTEXT_FILE, ...resumeData });
+      return toolJson({ file: sessionFile, indexFile: SESSION_INDEX_FILE, ...resumeData });
     }
 
     const lines = [];
-    lines.push(`Resume session ${session_id} from ${CONTEXT_FILE}`);
+    lines.push(`Resume session ${session_id} from ${sessionFile}`);
     if (resumeData.summary) {
       lines.push("");
       lines.push(formatSessionSummary(resumeData.summary, 0));
@@ -1829,7 +1982,7 @@ async function listResources() {
       {
         uri: "shared-context://raw",
         name: "Raw Shared Context JSONL",
-        description: "The raw append-only JSONL file containing notes and handoffs.",
+        description: "A merged raw NDJSON view of all per-session JSONL files.",
         mimeType: "application/x-ndjson",
       },
       {
@@ -1841,7 +1994,7 @@ async function listResources() {
       {
         uri: "shared-context://info",
         name: "Shared Context Server Info",
-        description: "Current file path and usage hints.",
+        description: "Current storage paths and usage hints.",
         mimeType: "application/json",
       },
     ],
@@ -1870,7 +2023,8 @@ async function readResource(uri) {
     const latest = latestHandoffs.length ? latestHandoffs[latestHandoffs.length - 1] : null;
     const recent = selectRecent(filtered, 10);
     const lines = [];
-    lines.push(`file: ${CONTEXT_FILE}`);
+    lines.push(`session_data_dir: ${SESSION_DATA_DIR}`);
+    lines.push(`session_index_file: ${SESSION_INDEX_FILE}`);
     lines.push(`default_project: ${DEFAULT_PROJECT}`);
     lines.push("");
     if (latest) {
@@ -1910,6 +2064,7 @@ async function readResource(uri) {
     const payload = {
       server: { name: SERVER_NAME, version: SERVER_VERSION },
       file: CONTEXT_FILE,
+      sessionDataDir: SESSION_DATA_DIR,
       lockFile: LOCK_FILE,
       sessionIndexFile: SESSION_INDEX_FILE,
       activeSessionFile: ACTIVE_SESSION_FILE,
@@ -2040,7 +2195,8 @@ async function getPrompt(params) {
   }
 
   await writeActiveSessionId(selectedSessionId);
-  const { entries, parseErrors } = await readEntries();
+  const sessionFile = resolveSessionFilePath(null, selectedSessionId);
+  const { entries, parseErrors } = await readEntries({ sessionIds: [selectedSessionId] });
   const resumeData = buildResumeSessionData(entries, parseErrors, {
     project,
     session_id: selectedSessionId,
@@ -2052,7 +2208,7 @@ async function getPrompt(params) {
       `Active session selected: ${selectedSessionId}`,
       `project=${project}`,
       "",
-      `No entries found yet for this session in ${CONTEXT_FILE}.`,
+      `No entries found yet for this session in ${sessionFile}.`,
       "You can start working and write notes/handoffs.",
     ].join("\n");
     return promptResponse("Select and resume a session", text);

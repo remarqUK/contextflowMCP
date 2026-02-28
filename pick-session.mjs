@@ -8,6 +8,7 @@ import { parsePositiveEnvInt, sanitizeDisplayText } from "./lib/common.mjs";
 
 const NO_SESSION_BUCKET = "(no-session-id)";
 const MAX_CONTEXT_FILE_BYTES = parsePositiveEnvInt("MCP_SHARED_CONTEXT_MAX_CONTEXT_FILE_BYTES", 50 * 1024 * 1024);
+const SESSION_INDEX_VERSION = 2;
 
 function expandHomePath(value) {
   if (typeof value !== "string" || !value) {
@@ -118,6 +119,26 @@ function parseEntries(rawText) {
   return entries;
 }
 
+async function readSessionIndex(contextFile) {
+  const indexFile = `${contextFile}.sessions-index.json`;
+  try {
+    const raw = await fs.readFile(indexFile, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { index: null, indexFile };
+    }
+    if (parsed.version !== SESSION_INDEX_VERSION || !parsed.projects || typeof parsed.projects !== "object") {
+      return { index: null, indexFile };
+    }
+    return { index: parsed, indexFile };
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return { index: null, indexFile };
+    }
+    throw error;
+  }
+}
+
 function truncate(value, max = 80) {
   if (typeof value !== "string") return undefined;
   const text = sanitizeDisplayText(value, { singleLine: true }).trim();
@@ -172,6 +193,62 @@ function buildSessionSummaries(entries, project, limit) {
   });
 
   return [...sessions.values()]
+    .sort((a, b) => {
+      const aTs = Number.isFinite(a.latest_ts_ms) ? a.latest_ts_ms : Number.NEGATIVE_INFINITY;
+      const bTs = Number.isFinite(b.latest_ts_ms) ? b.latest_ts_ms : Number.NEGATIVE_INFINITY;
+      if (bTs !== aTs) return bTs - aTs;
+      return b.latest_file_index - a.latest_file_index;
+    })
+    .slice(0, limit);
+}
+
+function buildSessionSummariesFromIndex(index, project, limit) {
+  const projectBucket = index?.projects?.[project];
+  if (!projectBucket || typeof projectBucket !== "object") {
+    return [];
+  }
+
+  const summaries = [];
+  Object.entries(projectBucket).forEach(([sessionIdKey, rawSummary]) => {
+    if (!rawSummary || typeof rawSummary !== "object") return;
+    const sessionId =
+      typeof rawSummary.session_id === "string" && rawSummary.session_id.trim()
+        ? rawSummary.session_id.trim()
+        : String(sessionIdKey || "").trim();
+    if (!sessionId || sessionId === NO_SESSION_BUCKET) return;
+
+    const latestTs = typeof rawSummary.latest_ts === "string" ? rawSummary.latest_ts : undefined;
+    const latestTsMsRaw =
+      typeof rawSummary.latest_ts_ms === "number" && Number.isFinite(rawSummary.latest_ts_ms)
+        ? rawSummary.latest_ts_ms
+        : Number.NaN;
+    const parsedLatestTs = latestTs ? Date.parse(latestTs) : Number.NaN;
+    const latestTsMs = Number.isFinite(latestTsMsRaw)
+      ? latestTsMsRaw
+      : Number.isFinite(parsedLatestTs)
+        ? parsedLatestTs
+        : Number.NEGATIVE_INFINITY;
+
+    summaries.push({
+      session_id: sessionId,
+      task: typeof rawSummary.task === "string" && rawSummary.task.trim() ? rawSummary.task.trim() : undefined,
+      latest_ts: latestTs,
+      latest_ts_ms: latestTsMs,
+      latest_file_index:
+        Number.isInteger(rawSummary.latest_file_index) && rawSummary.latest_file_index >= -1
+          ? rawSummary.latest_file_index
+          : -1,
+      entry_count: Number.isInteger(rawSummary.entry_count) && rawSummary.entry_count >= 0 ? rawSummary.entry_count : 0,
+      handoff_count:
+        Number.isInteger(rawSummary.handoff_count) && rawSummary.handoff_count >= 0 ? rawSummary.handoff_count : 0,
+      latest_handoff_summary:
+        typeof rawSummary.latest_handoff_summary === "string"
+          ? truncate(rawSummary.latest_handoff_summary, 110)
+          : undefined,
+    });
+  });
+
+  return summaries
     .sort((a, b) => {
       const aTs = Number.isFinite(a.latest_ts_ms) ? a.latest_ts_ms : Number.NEGATIVE_INFINITY;
       const bTs = Number.isFinite(b.latest_ts_ms) ? b.latest_ts_ms : Number.NEGATIVE_INFINITY;
@@ -266,7 +343,7 @@ function buildOptions(summaries, newSessionId) {
   return options;
 }
 
-function renderMenu({ options, selectedIndex, project, contextFile }) {
+function renderMenu({ options, selectedIndex, project, contextFile, indexFile }) {
   const rows = process.stdout.rows || 24;
   const pageSize = Math.max(5, rows - 7);
   let windowStart = Math.max(0, selectedIndex - Math.floor(pageSize / 2));
@@ -278,7 +355,8 @@ function renderMenu({ options, selectedIndex, project, contextFile }) {
   const lines = [];
   lines.push("ContextFlowMCP Session Picker");
   lines.push(`project: ${sanitizeDisplayText(project, { singleLine: true })}`);
-  lines.push(`file: ${sanitizeDisplayText(contextFile, { singleLine: true })}`);
+  lines.push(`root: ${sanitizeDisplayText(contextFile, { singleLine: true })}`);
+  lines.push(`index: ${sanitizeDisplayText(indexFile, { singleLine: true })}`);
   lines.push("Use Up/Down (or j/k), Enter to select, q or Esc to cancel.");
   lines.push("");
 
@@ -303,7 +381,7 @@ function clearAndWrite(text) {
   process.stdout.write("\n");
 }
 
-async function runInteractivePicker(options, project, contextFile) {
+async function runInteractivePicker(options, project, contextFile, indexFile) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("Interactive mode requires a TTY terminal.");
   }
@@ -330,12 +408,12 @@ async function runInteractivePicker(options, project, contextFile) {
       }
       if (key.name === "up" || key.name === "k") {
         selectedIndex = (selectedIndex - 1 + options.length) % options.length;
-        clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile }));
+        clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile, indexFile }));
         return;
       }
       if (key.name === "down" || key.name === "j") {
         selectedIndex = (selectedIndex + 1) % options.length;
-        clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile }));
+        clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile, indexFile }));
         return;
       }
       if (key.name === "return" || key.name === "enter") {
@@ -346,7 +424,7 @@ async function runInteractivePicker(options, project, contextFile) {
     }
 
     process.stdin.on("keypress", onKeypress);
-    clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile }));
+    clearAndWrite(renderMenu({ options, selectedIndex, project, contextFile, indexFile }));
   });
 }
 
@@ -398,15 +476,19 @@ async function main() {
   const limit = Number.isInteger(Number(args.limit)) ? Math.max(1, Number(args.limit)) : 50;
   const prefix = String(args.prefix || "session");
 
-  const raw = await readContextFile(contextFile);
-  const entries = parseEntries(raw);
-  const summaries = buildSessionSummaries(entries, project, limit);
+  const { index: sessionIndex, indexFile } = await readSessionIndex(contextFile);
+  let summaries = sessionIndex ? buildSessionSummariesFromIndex(sessionIndex, project, limit) : [];
+  if (!sessionIndex) {
+    const raw = await readContextFile(contextFile);
+    const entries = parseEntries(raw);
+    summaries = buildSessionSummaries(entries, project, limit);
+  }
   const newSessionId = await makeNewSessionId(prefix, process.cwd());
   const options = buildOptions(summaries, newSessionId);
 
   const interactive = !args.nonInteractive && process.stdin.isTTY && process.stdout.isTTY;
   const selected = interactive
-    ? await runInteractivePicker(options, project, contextFile)
+    ? await runInteractivePicker(options, project, contextFile, indexFile)
     : selectNonInteractive(options, String(args.select || "new"));
 
   if (!args.noSave) {
@@ -419,6 +501,7 @@ async function main() {
     selection: selected.kind,
     project,
     context_file: contextFile,
+    session_index_file: indexFile,
     active_session_file: activeFile,
   };
 

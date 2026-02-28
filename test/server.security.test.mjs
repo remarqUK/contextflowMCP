@@ -73,6 +73,33 @@ test("append_shared_note accepts content alias and falls back when text is empty
   assert.equal(payload.entries[0].text, "content-alias-value");
 });
 
+test("writes one JSONL file per session and keeps a shared index file", async (t) => {
+  const { client } = await startClient(t);
+
+  await client.callTool("append_shared_note", {
+    agent: "codex",
+    session_id: "session-a",
+    text: "note for session a",
+  });
+  await client.callTool("append_shared_note", {
+    agent: "codex",
+    session_id: "session-b",
+    text: "note for session b",
+  });
+
+  const infoResult = await client.request("resources/read", { uri: "shared-context://info" });
+  const infoPayload = JSON.parse(infoResult.contents[0].text);
+  const sessionFiles = (await fs.readdir(infoPayload.sessionDataDir)).filter((name) => name.endsWith(".jsonl"));
+  assert.equal(sessionFiles.length, 2);
+
+  const indexStat = await fs.stat(infoPayload.sessionIndexFile);
+  assert.ok(indexStat.isFile(), "session index file should exist");
+
+  const sessionsResult = await client.callTool("list_sessions", { format: "json" });
+  const sessionsPayload = parseToolJson(sessionsResult);
+  assert.equal(sessionsPayload.count, 2);
+});
+
 test("read_shared_context text output strips ANSI control sequences", async (t) => {
   const { client } = await startClient(t);
   await client.callTool("append_shared_note", {
@@ -91,13 +118,26 @@ test("read_shared_context text output strips ANSI control sequences", async (t) 
   assert.match(text, /hello RED world/);
 });
 
-test("context file size guard blocks oversized context reads", async (t) => {
-  const { client, contextFile } = await startClient(t, {
+test("context file size guard blocks oversized session reads", async (t) => {
+  const { client } = await startClient(t, {
     MCP_SHARED_CONTEXT_MAX_CONTEXT_FILE_BYTES: "64",
   });
-  await fs.writeFile(contextFile, `${"x".repeat(200)}\n`, "utf8");
 
-  const response = await client.callToolRaw("read_shared_context", { format: "json" });
+  await client.callTool("append_shared_note", {
+    agent: "codex",
+    session_id: "oversized-session",
+    text: "seed entry",
+  });
+  const infoResult = await client.request("resources/read", { uri: "shared-context://info" });
+  const infoPayload = JSON.parse(infoResult.contents[0].text);
+  const sessionFiles = (await fs.readdir(infoPayload.sessionDataDir)).filter((name) => name.endsWith(".jsonl"));
+  assert.ok(sessionFiles.length >= 1, "expected at least one session file");
+  await fs.writeFile(path.join(infoPayload.sessionDataDir, sessionFiles[0]), `${"x".repeat(200)}\n`, "utf8");
+
+  const response = await client.callToolRaw("read_shared_context", {
+    format: "json",
+    session_id: "oversized-session",
+  });
   assert.ok(response.error, "oversized context should return an error");
   assert.equal(response.error.code, -32603);
   assert.match(response.error.message, /Context file exceeds configured max size/);
@@ -280,7 +320,7 @@ test("falls back to home context file when no env or discoveries exist", async (
   assert.equal(infoPayload.contextFileSource, "home-default");
 });
 
-test("uses MCP_SHARED_CONTEXT_FOLDER for a single shared context file", async (t) => {
+test("uses MCP_SHARED_CONTEXT_FOLDER for shared context storage root", async (t) => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "contextflowmcp-folder-env-"));
   const sharedFolder = path.join(tempHome, "shared-contexts");
   const expectedFile = path.join(sharedFolder, ".mcp-shared-context.jsonl");
