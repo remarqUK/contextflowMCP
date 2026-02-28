@@ -6,7 +6,7 @@ Maintainers: see `MAINTAINER.md` for architecture and amendment guidance.
 
 
 
-This an example workflow:
+This is an example workflow:
 
 - Claude writes a handoff
 - Gemini reads it and continues
@@ -23,7 +23,7 @@ This an example workflow:
 - `resume_session`: load the latest handoff + recent entries for a chosen `session_id`
 - MCP prompt commands: `new_session`, `resume_#`, and `resume_by_id` for session picking
 
-It also exposes read-only MCP resources like `shared-context://raw` and `shared-context://latest`.
+It also exposes read-only MCP resources like `shared-context://raw`, `shared-context://latest`, and `shared-context://info`.
 
 ## Interactive Picker (MCP-Native)
 
@@ -51,6 +51,7 @@ node pick-session.mjs
 ## Storage Format
 
 - One append-only JSONL file per `session_id` (stored under `<context-root>.sessions/`)
+- Entries without `session_id` are stored in a dedicated `(no-session-id)` session file
 - Each line is a JSON object (`note` or `handoff`)
 - A shared sessions index file (`<context-root>.sessions-index.json`) is maintained for fast `list_sessions` and prompt-based session pickers
 - Safe for multiple MCP server processes using a simple lock file (`<context-root>.lock`)
@@ -77,6 +78,9 @@ Zero-config first run behavior (when `MCP_SHARED_CONTEXT_FILE` is unset):
 - Otherwise the server checks common Codex/Claude/Gemini config files for `MCP_SHARED_CONTEXT_FILE`.
 - If still not found, it checks common user config folders for existing context files (`.mcp-shared-context.jsonl`, `shared-context.jsonl`, `agent-context.jsonl`).
 - If nothing is found, it falls back to `~/.mcp-shared-context.jsonl`.
+
+Legacy note:
+- If a legacy single-file JSONL exists at the context root and no session files exist yet, the server migrates it into per-session files on first index rebuild.
 
 Recommended env vars:
 
