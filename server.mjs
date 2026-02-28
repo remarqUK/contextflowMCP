@@ -360,10 +360,10 @@ const tools = [
       type: "object",
       properties: {
         agent: { type: "string", description: "Agent name writing the note (e.g. codex, claude, gemini)." },
-        text: { type: "string", description: "The note text to append." },
+        text: { type: "string", description: "The note text to append. Provide this or `content`." },
         content: {
           type: "string",
-          description: "Alias for `text` for client compatibility.",
+          description: "Alias for `text` for client compatibility. Provide this or `text`.",
         },
         project: { type: "string", description: "Project key. Defaults to MCP_SHARED_CONTEXT_PROJECT or 'shared'." },
         session_id: { type: "string", description: "Optional session/thread/task id." },
@@ -375,10 +375,6 @@ const tools = [
         },
       },
       required: ["agent"],
-      anyOf: [
-        { required: ["text"] },
-        { required: ["content"] },
-      ],
       additionalProperties: false,
     },
   },
